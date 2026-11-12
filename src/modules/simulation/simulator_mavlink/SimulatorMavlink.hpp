@@ -224,6 +224,12 @@ private:
 	void handle_message(const mavlink_message_t *msg);
 	void handle_message_distance_sensor(const mavlink_message_t *msg);
 	void handle_message_hil_gps(const mavlink_message_t *msg);
+#if defined(MAVLINK_MSG_ID_HIL_GPS_EXT)
+	/* Decode HIL_GPS_EXT and publish sensor_gps with real ellipsoid altitude */
+	void handleMessageHilGpsExt(const mavlink_message_t *pMsg);
+#endif /* MAVLINK_MSG_ID_HIL_GPS_EXT */
+	/* Common sensor_gps fill/publish path shared by HIL_GPS and HIL_GPS_EXT */
+	void publishSimGps(const mavlink_hil_gps_t &hilGps, double altEllipsoidM);
 	void handle_message_hil_sensor(const mavlink_message_t *msg);
 	void handle_message_hil_state_quaternion(const mavlink_message_t *msg);
 	void handle_message_landing_target(const mavlink_message_t *msg);

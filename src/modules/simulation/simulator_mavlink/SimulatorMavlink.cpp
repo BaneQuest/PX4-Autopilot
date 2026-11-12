@@ -375,6 +375,14 @@ void SimulatorMavlink::handle_message(const mavlink_message_t *msg)
 		handle_message_hil_gps(msg);
 		break;
 
+#if defined(MAVLINK_MSG_ID_HIL_GPS_EXT)
+
+	/* HIL_GPS with ellipsoid altitude (px4_sitl_ext dialect only) */
+	case MAVLINK_MSG_ID_HIL_GPS_EXT:
+		handleMessageHilGpsExt(msg);
+		break;
+#endif /* MAVLINK_MSG_ID_HIL_GPS_EXT */
+
 	case MAVLINK_MSG_ID_RC_CHANNELS:
 		handle_message_rc_channels(msg);
 		break;
@@ -405,68 +413,143 @@ void SimulatorMavlink::handle_message_distance_sensor(const mavlink_message_t *m
 	publish_distance_topic(&dist);
 }
 
+/*
+ * Function    : handle_message_hil_gps
+ * Description : Decode standard HIL_GPS. HIL_GPS has no ellipsoid altitude,
+ *               so MSL altitude is reused as ellipsoid altitude (legacy behavior).
+ * Revision    : 2026-11-12 LeeWontaek - moved body into publishSimGps()
+ */
 void SimulatorMavlink::handle_message_hil_gps(const mavlink_message_t *msg)
 {
-	mavlink_hil_gps_t hil_gps;
-	mavlink_msg_hil_gps_decode(msg, &hil_gps);
+	mavlink_hil_gps_t hilGps{};
 
+	/* msg comes from the local parser and is never null here */
+	mavlink_msg_hil_gps_decode(msg, &hilGps);
+
+	/* Legacy behavior: ellipsoid altitude equals MSL altitude (mm -> m) */
+	publishSimGps(hilGps, static_cast<double>(hilGps.alt) / 1e3);
+}
+
+#if defined(MAVLINK_MSG_ID_HIL_GPS_EXT)
+/*
+ * Function    : handleMessageHilGpsExt
+ * Description : Decode HIL_GPS_EXT (px4_sitl_ext dialect). Fields shared with
+ *               HIL_GPS are copied into a mavlink_hil_gps_t so the common
+ *               publish path can be reused. alt_ellipsoid is passed separately.
+ * Revision    : 2026-11-12 LeeWontaek - initial creation
+ */
+void SimulatorMavlink::handleMessageHilGpsExt(const mavlink_message_t *pMsg)
+{
+	mavlink_hil_gps_ext_t hilGpsExt{};
+	mavlink_hil_gps_t hilGps{};
+
+	/* Guard against null message pointer (2.6.1) */
+	if (pMsg != nullptr) {
+		mavlink_msg_hil_gps_ext_decode(pMsg, &hilGpsExt);
+
+		/* Copy fields that have identical name, type and unit in HIL_GPS */
+		hilGps.time_usec = hilGpsExt.time_usec;
+		hilGps.fix_type = hilGpsExt.fix_type;
+		hilGps.lat = hilGpsExt.lat;
+		hilGps.lon = hilGpsExt.lon;
+		hilGps.alt = hilGpsExt.alt;
+		hilGps.eph = hilGpsExt.eph;
+		hilGps.epv = hilGpsExt.epv;
+		hilGps.vel = hilGpsExt.vel;
+		hilGps.vn = hilGpsExt.vn;
+		hilGps.ve = hilGpsExt.ve;
+		hilGps.vd = hilGpsExt.vd;
+		hilGps.cog = hilGpsExt.cog;
+		hilGps.satellites_visible = hilGpsExt.satellites_visible;
+		hilGps.id = hilGpsExt.id;
+		hilGps.yaw = hilGpsExt.yaw;
+
+		/* Real ellipsoid altitude from simulator (mm -> m) */
+		publishSimGps(hilGps, static_cast<double>(hilGpsExt.alt_ellipsoid) / 1e3);
+
+	} else {
+		/* Null message: nothing to publish */
+	}
+}
+#endif /* MAVLINK_MSG_ID_HIL_GPS_EXT */
+
+/*
+ * Function    : publishSimGps
+ * Description : Fill sensor_gps from HIL_GPS content and publish it on the
+ *               uORB instance matching the GPS id. Applies the GPS failure
+ *               injection states (blocked / stuck / wrong).
+ * Parameters  : hilGps        - decoded HIL_GPS content
+ *               altEllipsoidM - altitude above WGS84 ellipsoid [m]
+ * Revision    : 2026-11-12 LeeWontaek - extracted from handle_message_hil_gps,
+ *               ellipsoid altitude made a parameter
+ */
+void SimulatorMavlink::publishSimGps(const mavlink_hil_gps_t &hilGps, double altEllipsoidM)
+{
+	/* Blocked GPS failure: drop the sample entirely */
 	if (!_gps_blocked) {
 		sensor_gps_s gps{};
 
+		/* Stuck GPS failure: repeat the previous sample */
 		if (!_gps_stuck) {
+			/* Position: wrong GPS failure adds a fixed offset */
 			if (!_gps_wrong) {
-				gps.latitude_deg = hil_gps.lat / 1e7;
-				gps.longitude_deg = hil_gps.lon / 1e7;
-				gps.altitude_msl_m = hil_gps.alt / 1e3;
-				gps.altitude_ellipsoid_m = hil_gps.alt / 1e3;
+				gps.latitude_deg = hilGps.lat / 1e7;
+				gps.longitude_deg = hilGps.lon / 1e7;
+				gps.altitude_msl_m = hilGps.alt / 1e3;
+				gps.altitude_ellipsoid_m = altEllipsoidM;
 
 			} else {
-				gps.latitude_deg = hil_gps.lat / 1e7 + 1.0;
-				gps.longitude_deg = hil_gps.lon / 1e7 + 1.0;
-				gps.altitude_msl_m = hil_gps.alt / 1e3 + 100.0;
-				gps.altitude_ellipsoid_m = hil_gps.alt / 1e3 - 100.0;
+				gps.latitude_deg = hilGps.lat / 1e7 + 1.0;
+				gps.longitude_deg = hilGps.lon / 1e7 + 1.0;
+				gps.altitude_msl_m = hilGps.alt / 1e3 + 100.0;
+				gps.altitude_ellipsoid_m = altEllipsoidM - 100.0;
 			}
 
+			/* Fixed accuracy values for simulation */
 			gps.s_variance_m_s = 0.25f;
 			gps.c_variance_rad = 0.5f;
-			gps.fix_type = hil_gps.fix_type;
+			gps.fix_type = hilGps.fix_type;
 
-			gps.eph = (float)hil_gps.eph * 1e-2f; // cm -> m
-			gps.epv = (float)hil_gps.epv * 1e-2f; // cm -> m
+			gps.eph = (float)hilGps.eph * 1e-2f; // cm -> m
+			gps.epv = (float)hilGps.epv * 1e-2f; // cm -> m
 
 			gps.hdop = 0; // TODO
 			gps.vdop = 0; // TODO
 
+			/* No RF interference in simulation */
 			gps.noise_per_ms = 0;
 			gps.automatic_gain_control = 0;
 			gps.jamming_indicator = 0;
 			gps.jamming_state = 0;
 			gps.spoofing_state = 0;
 
+			/* Velocity: wrong GPS failure adds a fixed offset */
 			if (!_gps_wrong) {
-				gps.vel_m_s = (float)(hil_gps.vel) / 100.0f; // cm/s -> m/s
-				gps.vel_n_m_s = (float)(hil_gps.vn) / 100.0f; // cm/s -> m/s
-				gps.vel_e_m_s = (float)(hil_gps.ve) / 100.0f; // cm/s -> m/s
-				gps.vel_d_m_s = (float)(hil_gps.vd) / 100.0f; // cm/s -> m/s
+				gps.vel_m_s = (float)(hilGps.vel) / 100.0f; // cm/s -> m/s
+				gps.vel_n_m_s = (float)(hilGps.vn) / 100.0f; // cm/s -> m/s
+				gps.vel_e_m_s = (float)(hilGps.ve) / 100.0f; // cm/s -> m/s
+				gps.vel_d_m_s = (float)(hilGps.vd) / 100.0f; // cm/s -> m/s
 
 			} else {
-				gps.vel_m_s = (float)(hil_gps.vel) / 100.0f - 1.f; // cm/s -> m/s
-				gps.vel_n_m_s = (float)(hil_gps.vn) / 100.0f + 5.f; // cm/s -> m/s
-				gps.vel_e_m_s = (float)(hil_gps.ve) / 100.0f - 8.f; // cm/s -> m/s
-				gps.vel_d_m_s = (float)(hil_gps.vd) / 100.0f + 2.f; // cm/s -> m/s
+				gps.vel_m_s = (float)(hilGps.vel) / 100.0f - 1.f; // cm/s -> m/s
+				gps.vel_n_m_s = (float)(hilGps.vn) / 100.0f + 5.f; // cm/s -> m/s
+				gps.vel_e_m_s = (float)(hilGps.ve) / 100.0f - 8.f; // cm/s -> m/s
+				gps.vel_d_m_s = (float)(hilGps.vd) / 100.0f + 2.f; // cm/s -> m/s
 			}
 
-			gps.cog_rad = ((hil_gps.cog == 65535) ? NAN : matrix::wrap_2pi(math::radians(hil_gps.cog * 1e-2f))); // cdeg -> rad
+			/* Course over ground: 65535 means unknown */
+			gps.cog_rad = ((hilGps.cog == 65535) ? NAN : matrix::wrap_2pi(math::radians(hilGps.cog * 1e-2f))); // cdeg -> rad
 			gps.vel_ned_valid = true;
 
 			gps.timestamp_time_relative = 0;
-			gps.time_utc_usec = hil_gps.time_usec;
+			gps.time_utc_usec = hilGps.time_usec;
 
-			gps.satellites_used = hil_gps.satellites_visible;
+			gps.satellites_used = hilGps.satellites_visible;
 
 			gps.heading = NAN;
 			gps.heading_offset = NAN;
 
+			/* Remember sample for the stuck failure mode */
 			_gps_prev = gps;
 
 		} else {
@@ -477,21 +560,23 @@ void SimulatorMavlink::handle_message_hil_gps(const mavlink_message_t *msg)
 
 		// New publishers will be created based on the HIL_GPS ID's being different or not
 		for (size_t i = 0; i < sizeof(_gps_ids) / sizeof(_gps_ids[0]); i++) {
-			if (_sensor_gps_pubs[i] && _gps_ids[i] == hil_gps.id) {
+			/* Existing publisher for this GPS id */
+			if (_sensor_gps_pubs[i] && _gps_ids[i] == hilGps.id) {
 				_sensor_gps_pubs[i]->publish(gps);
 				break;
 			}
 
+			/* First sample of a new GPS id: create a publisher */
 			if (_sensor_gps_pubs[i] == nullptr) {
 				_sensor_gps_pubs[i] = new uORB::PublicationMulti<sensor_gps_s> {ORB_ID(sensor_gps)};
-				_gps_ids[i] = hil_gps.id;
+				_gps_ids[i] = hilGps.id;
 
-				device::Device::DeviceId device_id;
-				device_id.devid_s.bus_type = device::Device::DeviceBusType::DeviceBusType_SIMULATION;
-				device_id.devid_s.bus = 0;
-				device_id.devid_s.address = i;
-				device_id.devid_s.devtype = DRV_GPS_DEVTYPE_SIM;
-				gps.device_id = device_id.devid;
+				device::Device::DeviceId deviceId;
+				deviceId.devid_s.bus_type = device::Device::DeviceBusType::DeviceBusType_SIMULATION;
+				deviceId.devid_s.bus = 0;
+				deviceId.devid_s.address = i;
+				deviceId.devid_s.devtype = DRV_GPS_DEVTYPE_SIM;
+				gps.device_id = deviceId.devid;
 
 				_sensor_gps_pubs[i]->publish(gps);
 				break;

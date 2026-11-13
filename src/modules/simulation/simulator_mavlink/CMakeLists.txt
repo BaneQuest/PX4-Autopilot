@@ -53,6 +53,31 @@ px4_add_module(
 		drivers_magnetometer
 	)
 
+# Optional GeographicLib support for geoid height (EGM96) in HIL_GPS handling.
+# GeographicLib is taken from commonlibs, located next to the PX4 source tree:
+#   ${PX4_SOURCE_DIR}/../commonlibs/lib/libGeographicLib.a   (built by commonlibs/build.sh)
+#   ${PX4_SOURCE_DIR}/../commonlibs/include/GeographicLib/
+#   ${PX4_SOURCE_DIR}/../commonlibs/geoids/egm96-5.pgm      (geoid grid, runtime)
+# Only GeographicLib is used; libCommonLibs.a (GeoMath, C++20) is not linked.
+# If GeographicLib is not found, the module builds without geoid correction (N = 0).
+get_filename_component(SIM_COMMONLIBS_ROOT "${PX4_SOURCE_DIR}/../commonlibs" ABSOLUTE)
+set(SIM_GEOGRAPHICLIB_LIB "${SIM_COMMONLIBS_ROOT}/lib/libGeographicLib.a")
+set(SIM_GEOGRAPHICLIB_INC "${SIM_COMMONLIBS_ROOT}/include")
+set(SIM_GEOID_DATA_DIR "${SIM_COMMONLIBS_ROOT}/geoids")
+
+if(EXISTS "${SIM_GEOGRAPHICLIB_LIB}" AND EXISTS "${SIM_GEOGRAPHICLIB_INC}/GeographicLib/Geoid.hpp")
+	message(STATUS "simulator_mavlink: GeographicLib found in ${SIM_COMMONLIBS_ROOT} (geoid correction enabled)")
+	# SYSTEM include so third-party header warnings do not break the PX4 build
+	target_include_directories(modules__simulation__simulator_mavlink SYSTEM PRIVATE "${SIM_GEOGRAPHICLIB_INC}")
+	target_link_libraries(modules__simulation__simulator_mavlink PRIVATE "${SIM_GEOGRAPHICLIB_LIB}")
+	target_compile_definitions(modules__simulation__simulator_mavlink PRIVATE
+		PX4_SIM_GEOID_ENABLED=1
+		PX4_SIM_GEOID_DATA_DIR="${SIM_GEOID_DATA_DIR}"
+	)
+else()
+	message(WARNING "simulator_mavlink: GeographicLib not found in ${SIM_COMMONLIBS_ROOT}, building without geoid correction (N = 0)")
+endif()
+
 include(sitl_targets_flightgear.cmake)
 include(sitl_targets_gazebo-classic.cmake)
 include(sitl_targets_jmavsim.cmake)

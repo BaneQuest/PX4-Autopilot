@@ -80,6 +80,27 @@
 
 #include <random>
 
+#if defined(PX4_SIM_GEOID_ENABLED)
+/* GeographicLib geoid model (EGM96) used to compute ellipsoid altitude */
+#include <memory>
+/* PX4 systemlib/err.h defines function-like macros (err, errx, warn, warnx)
+ * that clash with identifiers inside GeographicLib headers. Suspend them
+ * only while including GeographicLib, then restore. */
+#pragma push_macro("err")
+#pragma push_macro("errx")
+#pragma push_macro("warn")
+#pragma push_macro("warnx")
+#undef err
+#undef errx
+#undef warn
+#undef warnx
+#include <GeographicLib/Geoid.hpp>
+#pragma pop_macro("warnx")
+#pragma pop_macro("warn")
+#pragma pop_macro("errx")
+#pragma pop_macro("err")
+#endif /* PX4_SIM_GEOID_ENABLED */
+
 #include <mavlink.h>
 #include <mavlink_types.h>
 
@@ -224,6 +245,11 @@ private:
 	void handle_message(const mavlink_message_t *msg);
 	void handle_message_distance_sensor(const mavlink_message_t *msg);
 	void handle_message_hil_gps(const mavlink_message_t *msg);
+
+	/* Load the geoid model once (no-op when GeographicLib is not available) */
+	void loadGeoidModel();
+	/* Geoid height N [m] at lat/lon [deg]; returns 0 when unavailable */
+	double getGeoidHeight(double latitudeDeg, double longitudeDeg);
 	void handle_message_hil_sensor(const mavlink_message_t *msg);
 	void handle_message_hil_state_quaternion(const mavlink_message_t *msg);
 	void handle_message_landing_target(const mavlink_message_t *msg);
@@ -297,6 +323,13 @@ private:
 	bool _gps_stuck{false};
 	bool _gps_wrong{false};
 	sensor_gps_s _gps_prev{};
+
+#if defined(PX4_SIM_GEOID_ENABLED)
+	/* Geoid model instance; null when loading failed */
+	std::unique_ptr<GeographicLib::Geoid> m_pGeoid{};
+#endif /* PX4_SIM_GEOID_ENABLED */
+	/* True after the first geoid height has been logged */
+	bool m_geoidHeightLogged{false};
 	bool _airspeed_disconnected{false};
 	hrt_abstime _airspeed_blocked_timestamp{0};
 	bool _vio_blocked{false};

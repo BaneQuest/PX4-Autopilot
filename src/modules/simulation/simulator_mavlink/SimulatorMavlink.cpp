@@ -46,6 +46,7 @@
 #include <lib/drivers/device/Device.hpp>
 
 #include <arpa/inet.h>
+#include <cstdlib> /* getenv() for geoid data path */
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -405,6 +406,95 @@ void SimulatorMavlink::handle_message_distance_sensor(const mavlink_message_t *m
 	publish_distance_topic(&dist);
 }
 
+/*
+ * Function    : loadGeoidModel
+ * Description : Load the EGM96 geoid model (egm96-5) once at startup.
+ *               Search path: GEOGRAPHICLIB_GEOID_PATH if set, otherwise
+ *               the commonlibs geoid directory injected at build time
+ *               (PX4_SIM_GEOID_DATA_DIR = <PX4>/../commonlibs/geoids).
+ *               On failure the geoid height stays 0 (legacy behavior:
+ *               ellipsoid altitude = MSL).
+ * Design      : GeoideImpl.md (11-13 Geoide Height, A2/A6/A13),
+ *               GeoideImpl_2.md (commonlibs, A4/A6/A12)
+ * Revision    : 2026-11-13 LeeWontaek - initial creation
+ *               2026-11-13 LeeWontaek - geoid path moved to commonlibs/geoids
+ */
+void SimulatorMavlink::loadGeoidModel()
+{
+#if defined(PX4_SIM_GEOID_ENABLED)
+	static const char kGeoidModelName[] = "egm96-5";
+	std::string geoidPath{};
+	const char *pEnvGeoidPath = getenv("GEOGRAPHICLIB_GEOID_PATH");
+
+	/* Resolve geoid data directory: environment override first */
+	if ((pEnvGeoidPath != nullptr) && (pEnvGeoidPath[0] != '\0')) {
+		geoidPath = pEnvGeoidPath;
+
+	} else {
+		/* Default: commonlibs geoid directory (absolute path from CMake) */
+		geoidPath = PX4_SIM_GEOID_DATA_DIR;
+	}
+
+	/* GeographicLib reports errors via exceptions */
+	try {
+		m_pGeoid.reset(new GeographicLib::Geoid(kGeoidModelName, geoidPath));
+		PX4_INFO("geoid model %s loaded (%s)", kGeoidModelName, m_pGeoid->GeoidFile().c_str());
+
+	} catch (const std::exception &e) {
+		m_pGeoid.reset();
+		PX4_WARN("geoid model %s not loaded (%s), using N = 0", kGeoidModelName, e.what());
+	}
+
+#else
+	PX4_WARN("built without GeographicLib, geoid height N = 0");
+#endif /* PX4_SIM_GEOID_ENABLED */
+}
+
+/*
+ * Function    : getGeoidHeight
+ * Description : Return geoid height N [m] (EGM96) at the given position.
+ *               Returns 0 when the model is not loaded or evaluation fails.
+ *               The first valid value is logged once.
+ * Design      : GeoideImpl.md (11-13 Geoide Height, A7/A13)
+ * Revision    : 2026-11-13 LeeWontaek - initial creation
+ */
+double SimulatorMavlink::getGeoidHeight(double latitudeDeg, double longitudeDeg)
+{
+	double geoidHeightM = 0.0;
+
+#if defined(PX4_SIM_GEOID_ENABLED)
+
+	/* Evaluate only when the model was loaded successfully */
+	if (m_pGeoid != nullptr) {
+		try {
+			geoidHeightM = (*m_pGeoid)(latitudeDeg, longitudeDeg);
+
+		} catch (const std::exception &e) {
+			geoidHeightM = 0.0;
+			PX4_WARN("geoid evaluation failed (%s), using N = 0", e.what());
+		}
+
+		/* Log the first computed geoid height once */
+		if (!m_geoidHeightLogged) {
+			m_geoidHeightLogged = true;
+			PX4_INFO("geoid height N = %.3f m at lat %.7f lon %.7f", geoidHeightM, latitudeDeg, longitudeDeg);
+
+		} else {
+			/* Already logged */
+		}
+
+	} else {
+		/* Model not loaded: N stays 0 */
+	}
+
+#else
+	(void)latitudeDeg;
+	(void)longitudeDeg;
+#endif /* PX4_SIM_GEOID_ENABLED */
+
+	return geoidHeightM;
+}
+
 void SimulatorMavlink::handle_message_hil_gps(const mavlink_message_t *msg)
 {
 	mavlink_hil_gps_t hil_gps;
@@ -414,17 +504,22 @@ void SimulatorMavlink::handle_message_hil_gps(const mavlink_message_t *msg)
 		sensor_gps_s gps{};
 
 		if (!_gps_stuck) {
+			/* Geoid height N [m] at the true GPS position (0 if unavailable).
+			 * hil_gps.alt is MSL [mm]; ellipsoid altitude = MSL + N. */
+			const double geoidHeightM = getGeoidHeight(hil_gps.lat / 1e7, hil_gps.lon / 1e7);
+
 			if (!_gps_wrong) {
 				gps.latitude_deg = hil_gps.lat / 1e7;
 				gps.longitude_deg = hil_gps.lon / 1e7;
 				gps.altitude_msl_m = hil_gps.alt / 1e3;
-				gps.altitude_ellipsoid_m = hil_gps.alt / 1e3;
+				gps.altitude_ellipsoid_m = hil_gps.alt / 1e3 + geoidHeightM;
 
 			} else {
 				gps.latitude_deg = hil_gps.lat / 1e7 + 1.0;
 				gps.longitude_deg = hil_gps.lon / 1e7 + 1.0;
 				gps.altitude_msl_m = hil_gps.alt / 1e3 + 100.0;
-				gps.altitude_ellipsoid_m = hil_gps.alt / 1e3 - 100.0;
+				/* GPS failure injection: keep the -100 m offset, add geoid height */
+				gps.altitude_ellipsoid_m = hil_gps.alt / 1e3 - 100.0 + geoidHeightM;
 			}
 
 			gps.s_variance_m_s = 0.25f;
@@ -1098,6 +1193,9 @@ void SimulatorMavlink::run()
 #else
 	pthread_setname_np(pthread_self(), "sim_rcv");
 #endif
+
+	/* Load geoid model once before receiving HIL_GPS (same thread as handlers) */
+	loadGeoidModel();
 
 	struct sockaddr_in _myaddr {};
 	_myaddr.sin_family = AF_INET;
